@@ -1,0 +1,1 @@
+# File for the propagation loop and results container, keeps history of data maybe for propagating
