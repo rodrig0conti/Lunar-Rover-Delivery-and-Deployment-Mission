@@ -1,157 +1,139 @@
-"""
-spacecraft.py
-=============
-The vehicle: its state, its mass properties and its propulsion model.
-
-State vector convention (7 elements, MCI frame)
------------------------------------------------
-    y = [ rx, ry, rz, vx, vy, vz, m ]
-        [ km  km  km  km/s km/s km/s  kg ]
-
-Mass is carried inside the integrated state rather than updated separately,
-because during a burn the mass flow and the acceleration are coupled: the
-same integrator step must see both. In Step 1 no engine is fired, so mass is
-constant and the seventh element simply stays put - but the slot is already
-there, which means Phase 2 (deorbit burn) needs no structural change.
-"""
+# Spacecraft class (relay and lunar lander) and its state
 
 import numpy as np
-
-from config import SpacecraftConfig
+from mathutils import elements_to_state, mean_motion
 
 
 class Spacecraft:
-    """Point-mass vehicle with a throttleable, constant-Isp engine."""
+    # A vehicle in orbit. State in MCI:
+    #     y = [rx, ry, rz, vx, vy, vz, m]      km, km/s, kg
 
-    # Index slices into the state vector, so no other module hard-codes them.
-    IDX_POS = slice(0, 3)
-    IDX_VEL = slice(3, 6)
-    IDX_MASS = 6
-    STATE_DIM = 7
+    # Mass is inside the integrated state: during a burn the acceleration depends
+    # on the mass and the mass flow on the thrust, so both must advance together.
 
-    def __init__(self,
-                 mass_wet: float = SpacecraftConfig.MASS_WET,
-                 mass_dry: float = SpacecraftConfig.MASS_DRY,
-                 thrust_max: float = SpacecraftConfig.THRUST_MAX,
-                 isp: float = SpacecraftConfig.ISP,
-                 throttle_min: float = SpacecraftConfig.THROTTLE_MIN,
-                 name: str = "Descent Module"):
+    # With set_attitude_control the state grows to fourteen elements,
+    #     y = [r, v, m, qw, qx, qy, qz, wx, wy, wz]
+    # q body-to-inertial, omega in body axes. Dynamics picks the layout by length.
 
+    def __init__(self, name, mass, mesh_path=None, colour="#cccccc"):
         self.name = name
-        self.mass_wet = mass_wet
-        self.mass_dry = mass_dry
-        self.thrust_max = thrust_max      # [kN]
-        self.isp = isp                    # [s]
-        self.throttle_min = throttle_min
-        self.g0 = SpacecraftConfig.G0     # [km/s^2]
+        self.mass = mass
+        self.mesh_path = mesh_path
+        self.colour = colour
+        self.state = np.zeros(7)
 
-        # Effective exhaust velocity [km/s]
-        self.v_exhaust = self.isp * self.g0
+    def set_orbit(self, mu, sma, ecc, inc, raan, aop, ta):
+        # Initialise the state from Keplerian elements.
+        r, v = elements_to_state(mu, sma, ecc, inc, raan, aop, ta)
+        self.state = np.concatenate([r, v, [self.mass]])
+        self._mu, self._sma, self._ta0 = mu, sma, ta
+        self._inc, self._raan, self._aop, self._ecc = inc, raan, aop, ecc
+        return self.state
 
-        # Commanded control, refreshed each step by the guidance layer.
-        # In Step 1 both stay at their defaults and the vehicle coasts.
-        self.throttle = 0.0                                  # [0, 1]
-        self.thrust_direction = np.array([1.0, 0.0, 0.0])    # unit, MCI
-
-        # Bookkeeping accumulated over a run.
-        self.delta_v_used = 0.0     # [km/s]
-        self.propellant_used = 0.0  # [kg]
-
-    # -----------------------------------------------------------------
-    # State construction and access
-    # -----------------------------------------------------------------
-
-    def initial_state(self, r_vec: np.ndarray, v_vec: np.ndarray,
-                      mass: float = None) -> np.ndarray:
-        """Assemble a state vector from position, velocity and mass."""
-        m = self.mass_wet if mass is None else mass
-        return np.concatenate([np.asarray(r_vec, dtype=float),
-                               np.asarray(v_vec, dtype=float),
-                               [m]])
-
-    @staticmethod
-    def position(state: np.ndarray) -> np.ndarray:
-        return state[Spacecraft.IDX_POS]
-
-    @staticmethod
-    def velocity(state: np.ndarray) -> np.ndarray:
-        return state[Spacecraft.IDX_VEL]
-
-    @staticmethod
-    def mass(state: np.ndarray) -> float:
-        return state[Spacecraft.IDX_MASS]
-
-    # -----------------------------------------------------------------
-    # Propulsion
-    # -----------------------------------------------------------------
+    def state_at(self, t):
+        # Closed-form state at time t, exact for ecc = 0. Reference for the integrator.
+        ta = self._ta0 + mean_motion(self._mu, self._sma) * t
+        r, v = elements_to_state(self._mu, self._sma, self._ecc,
+                                 self._inc, self._raan, self._aop, ta)
+        return np.concatenate([r, v, [self.mass]])
 
     @property
-    def propellant_mass(self) -> float:
-        """Usable propellant at the start of the mission [kg]."""
-        return self.mass_wet - self.mass_dry
+    def position(self):
+        return self.state[0:3]
 
-    def thrust_magnitude(self, mass: float) -> float:
-        """
-        Delivered thrust for the current throttle command [kN].
+    @property
+    def velocity(self):
+        return self.state[3:6]
 
-        Returns zero if the tanks are empty or if the command sits below the
-        deep-throttling limit, since a real engine cannot be commanded there.
-        """
-        if mass <= self.mass_dry + 1e-9:
+    def __repr__(self):
+        return f"<Spacecraft '{self.name}': m={self.mass:.1f} kg>"
+    
+    # Propulsion
+
+    def set_propulsion(self, mass_dry, thrust_max, isp,
+                       throttle_min=0.30):
+        # Attach an engine. Units: kg, kN, s.
+        from config import PropulsionConfig
+        self.mass_dry = mass_dry
+        self.thrust_max = thrust_max
+        self.isp = isp
+        self.throttle_min = throttle_min
+        self.v_exhaust = isp * PropulsionConfig.G0    # [km/s]
+
+        # commanded by guidance each step, zero means coasting
+        self.throttle = 0.0
+        self.thrust_direction = np.array([1.0, 0.0, 0.0])
+
+    def thrust_magnitude(self, mass):
+        # Delivered thrust [kN]. Zero with dry tanks or below the deep-throttling
+        # limit, where a real engine cannot be commanded.
+        if mass <= self.mass_dry + 1e-9 or self.throttle <= 0.0:
             return 0.0
-        if self.throttle <= 0.0:
-            return 0.0
+        return float(np.clip(self.throttle, self.throttle_min, 1.0)) * self.thrust_max
 
-        cmd = np.clip(self.throttle, self.throttle_min, 1.0)
-        return cmd * self.thrust_max
-
-    def thrust_acceleration(self, mass: float) -> np.ndarray:
-        """Acceleration produced by the engine, in MCI [km/s^2]."""
+    def thrust_acceleration(self, mass):
+        # Engine acceleration in MCI [km/s^2].
         f = self.thrust_magnitude(mass)
         if f == 0.0:
             return np.zeros(3)
+        d = np.asarray(self.thrust_direction, dtype=float)
+        n = np.linalg.norm(d)
+        return (f / mass) * (d / n) if n > 1e-12 else np.zeros(3)
 
-        direction = self.thrust_direction
-        norm = np.linalg.norm(direction)
-        if norm < 1e-12:
-            return np.zeros(3)
-
-        return (f / mass) * (direction / norm)
-
-    def mass_flow_rate(self, mass: float) -> float:
-        """Propellant consumption rate [kg/s], returned as a positive number."""
+    def mass_flow_rate(self, mass):
+        # Propellant consumption [kg/s], positive. mdot = F / (Isp g0).
         f = self.thrust_magnitude(mass)
         return f / self.v_exhaust if f > 0.0 else 0.0
 
-    # -----------------------------------------------------------------
-    # Performance figures
-    # -----------------------------------------------------------------
-
-    def delta_v_capability(self, mass_current: float = None) -> float:
-        """
-        Remaining delta-v from the Tsiolkovsky equation [km/s].
-
-        This is the number that decides whether the descent strategy closes,
-        so it is worth having available at every instant of the simulation.
-        """
-        m0 = self.mass_wet if mass_current is None else mass_current
+    def delta_v_capability(self, mass_current=None):
+        # Remaining delta-v [km/s] from Tsiolkovsky: dv = ve ln(m0/m_dry).
+        m0 = self.mass if mass_current is None else mass_current
         return self.v_exhaust * np.log(m0 / self.mass_dry)
 
-    def thrust_to_weight(self, mass: float, g_local: float) -> float:
-        """Thrust-to-weight ratio against the local gravity. Dimensionless."""
+    def thrust_to_weight(self, mass, g_local):
+        # Thrust over local weight. Must exceed 1 to decelerate; braking needs more
+        # than that, or gravity losses grow.
         return self.thrust_magnitude(mass) / (mass * g_local)
 
-    def set_command(self, throttle: float, direction: np.ndarray) -> None:
-        """Apply a guidance command. Called by the phase/guidance layer."""
+    def set_command(self, throttle, direction):
+        # Apply a guidance command.
         self.throttle = float(np.clip(throttle, 0.0, 1.0))
         self.thrust_direction = np.asarray(direction, dtype=float)
 
-    def coast(self) -> None:
-        """Shut the engine down."""
+    def coast(self):
+        # Shut the engine down.
         self.throttle = 0.0
 
-    def __repr__(self) -> str:
-        return (f"<Spacecraft '{self.name}': "
-                f"m_wet={self.mass_wet:.1f} kg, m_dry={self.mass_dry:.1f} kg, "
-                f"Isp={self.isp:.0f} s, F_max={self.thrust_max * 1e3:.0f} N, "
-                f"dv_max={self.delta_v_capability() * 1e3:.0f} m/s>")
+    # Attitude coupling, optional. Without it the state is 7 elements and
+    # guidance assigns the thrust direction; with it the state is 14 and the
+    # thrust direction is read off the body attitude.
+
+    has_attitude = False        # class default, so getattr checks are safe
+
+    def set_attitude_control(self, inertia, rcs, controller,
+                             body_thrust_axis=(0.0, 0.0, 1.0)):
+        # Attach rotational dynamics and a controller.
+        #     inertia          3x3 tensor in body axes [kg m^2], from inertia.py
+        #     rcs              ThrusterCluster from rcs.py
+        #     controller       AttitudeController from control.py
+        #     body_thrust_axis engine push direction, +Z here (engine at -Z)
+        self.inertia = np.asarray(inertia, dtype=float)
+        self.inertia_inv = np.linalg.inv(self.inertia)
+        self.rcs = rcs
+        self.controller = controller
+        self.body_thrust_axis = np.asarray(body_thrust_axis, dtype=float)
+        self.torque = np.zeros(3)       # body axes [N m], set each step
+        self.has_attitude = True
+
+    def initial_state_full(self, q=None, omega=None):
+        # Assemble [r, v, m, q, omega] from the orbit already set by set_orbit.
+        from attitude import quat_identity, quat_normalise
+        q = quat_identity() if q is None else quat_normalise(
+            np.asarray(q, dtype=float))
+        w = np.zeros(3) if omega is None else np.asarray(omega, dtype=float)
+        return np.concatenate([self.state[0:7], q, w])
+
+    def thrust_direction_from_attitude(self, q):
+        # Where the engine actually points, in inertial axes.
+        from attitude import rotate_body_to_inertial
+        return rotate_body_to_inertial(q, self.body_thrust_axis)

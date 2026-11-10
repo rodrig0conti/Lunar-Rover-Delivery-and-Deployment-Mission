@@ -1,0 +1,12 @@
+[MASS-040]  RCS propellant load shall be no less than 8.8 kg for the
+            nominal descent, excluding disturbance rejection.
+            source: descent.py with attitude coupled
+
+[ACS-010]   (PROVISIONAL) Attitude control shall deliver at least 14.4 N m
+            of torque about pitch and yaw.
+            source: rcs.py standard layout; inertia is placeholder pending CAD
+
+[ACS-020]   Attitude shall be held inertially during the coast, with a single
+            slew to retrograde initiated 400 s before PDI.
+            source: continuous retrograde tracking costs 62 kg of RCS
+            propellant against 8.8 kg for the single slew

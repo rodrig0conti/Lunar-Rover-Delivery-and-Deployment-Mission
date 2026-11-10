@@ -1,142 +1,68 @@
-"""
-main.py
-=======
-Entry point. Assembles the model, propagates it and produces the outputs.
-
-Step 1 scope
-------------
-Central body with rotation and gravity (J2 optional), spacecraft state
-propagated in the inertial frame, no engine firing. The purpose of this step
-is to establish the frames, the integration loop and the visualisation, and to
-verify them against conserved quantities before any manoeuvre is introduced.
-
-Usage
------
-    python main.py                      # 3 orbits, plots to screen
-    python main.py --orbits 5           # longer run
-    python main.py --animate            # animation window
-    python main.py --animate --save out.gif
-    python main.py --no-j2              # pure two-body (validation case)
-"""
-
-import argparse
+# Initial conditions and output selection (animation, plots, data)
 
 import numpy as np
-import matplotlib.pyplot as plt
+import vtk
 
-from config import MoonConstants, OrbitConfig, SimConfig, SiteConfig
-from moon import Moon
+from config import OrbitConfig, PropulsionConfig, DisplayConfig
+from moon_environment import Moon
 from spacecraft import Spacecraft
-from dynamics import Dynamics
-from simulation import Simulation
-from mathutils import elements_to_state
-import visualization as viz
+from rcs import standard_layout
+from control import AttitudeController
+from inertia import build_descent_module
+from mission import run_mission
+from visualization import show_full_mission
+from calculations import mission_timeline
 
 
-def build_model(enable_j2: bool = True):
-    """Instantiate the Moon, the vehicle and the force model."""
-    moon = Moon(enable_j2=enable_j2)
-    craft = Spacecraft()
-    dyn = Dynamics(moon, craft)
-    return moon, craft, dyn
+vtk.vtkObject.GlobalWarningDisplayOff()
 
 
-def initial_conditions(moon, craft):
-    """
-    Build the initial state from the parking-orbit definition in config.
+# Model
 
-    The state is generated from Keplerian elements rather than hard-coded
-    vectors, so changing the orbit is a one-line edit in config.py.
-    """
-    r0, v0 = elements_to_state(
-        mu=moon.mu,
-        sma=OrbitConfig.SMA,
-        ecc=OrbitConfig.ECC,
-        inc=OrbitConfig.INC,
-        raan=OrbitConfig.RAAN,
-        aop=OrbitConfig.AOP,
-        ta=OrbitConfig.TA,
-    )
-    return craft.initial_state(r0, v0)
+moon = Moon()
 
+relay = Spacecraft("Relay", mass=250.0)
+lander = Spacecraft("Lander", mass=PropulsionConfig.MASS_WET)
 
-def print_header(moon, craft):
-    period = moon.orbital_period(OrbitConfig.SMA)
-    v_circ = moon.circular_velocity(OrbitConfig.SMA)
+# Both start attached, so they share one orbit
+for craft in (relay, lander):
+    craft.set_orbit(moon.mu, OrbitConfig.SMA, OrbitConfig.ECC,
+                    OrbitConfig.INC, OrbitConfig.RAAN,
+                    OrbitConfig.AOP, OrbitConfig.TA)
 
-    print("=" * 62)
-    print(" LUNAR DELIVERY SYSTEM — DESCENT SIMULATOR")
-    print(" Step 1: central body dynamics and orbital propagation")
-    print("=" * 62)
-    print(f" Central body   : Moon, mu = {moon.mu:.3f} km^3/s^2, "
-          f"R = {moon.radius:.1f} km")
-    print(f" Spin period    : {MoonConstants.SIDEREAL_PERIOD / 86400.0:.4f} "
-          f"days  (omega = {moon.omega:.4e} rad/s)")
-    print(f" J2 oblateness  : {'ON' if moon.enable_j2 else 'OFF'}")
-    print("-" * 62)
-    print(f" Parking orbit  : {OrbitConfig.ALTITUDE:.1f} km circular, "
-          f"i = {np.rad2deg(OrbitConfig.INC):.1f} deg")
-    print(f" Orbital period : {period / 3600.0:.4f} h ({period:.1f} s)")
-    print(f" Orbital speed  : {v_circ:.4f} km/s")
-    print(f" Landing site   : {SiteConfig.NAME}")
-    print(f"                  lat {np.rad2deg(SiteConfig.LATITUDE):.2f} deg, "
-          f"lon {np.rad2deg(SiteConfig.LONGITUDE):.2f} deg")
-    print("-" * 62)
-    print(f" Vehicle        : {craft!r}")
-    print("=" * 62)
-    return period
+lander.set_propulsion(PropulsionConfig.MASS_DRY, PropulsionConfig.THRUST_MAX,
+                      PropulsionConfig.ISP, PropulsionConfig.THROTTLE_MIN)
+
+# attitude, after set_propulsion
+inertia = build_descent_module(PropulsionConfig.MASS_WET
+                               - PropulsionConfig.MASS_DRY).inertia()
+rcs = standard_layout()
+lander.set_attitude_control(
+    inertia, rcs, AttitudeController(rcs, inertia, deadband_deg=0.2))
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Lunar descent simulator")
-    parser.add_argument("--orbits", type=float, default=3.0,
-                        help="run duration in orbital periods")
-    parser.add_argument("--dt", type=float, default=SimConfig.DT,
-                        help="integration step [s]")
-    parser.add_argument("--integrator", default=SimConfig.INTEGRATOR,
-                        choices=["rk4", "rk45"])
-    parser.add_argument("--no-j2", action="store_true",
-                        help="disable J2 (pure two-body validation case)")
-    parser.add_argument("--animate", action="store_true")
-    parser.add_argument("--save", default=None,
-                        help="save the animation to this GIF path")
-    parser.add_argument("--spin-exaggeration", type=float, default=1.0,
-                        help="display-only multiplier on the lunar spin rate")
-    parser.add_argument("--no-show", action="store_true",
-                        help="do not open figure windows")
-    args = parser.parse_args()
+# Run
 
-    # --- Model -------------------------------------------------------
-    moon, craft, dyn = build_model(enable_j2=not args.no_j2)
-    period = print_header(moon, craft)
+h_stack, h_relay, h_lander, guidance, t_sep = run_mission(
+    moon, relay, lander,
+    h_pdi=12.0,
+    n_orbits_before_sep=OrbitConfig.N_ORBITS_BEFORE_SEP)
+mission_timeline(moon, h_stack, h_relay, h_lander, guidance, t_sep)
 
-    # --- Initial conditions and propagation --------------------------
-    state0 = initial_conditions(moon, craft)
-    sim = Simulation(moon, craft, dyn, dt=args.dt,
-                     integrator=args.integrator)
-
-    history = sim.run(state0, t_final=args.orbits * period)
-    print()
-    print(history.summary())
-
-    # --- Output ------------------------------------------------------
-    viz.plot_trajectory_3d(history, moon)
-    viz.plot_groundtrack(history)
-    viz.plot_diagnostics(history)
-
-    anim = None
-    if args.animate or args.save:
-        _, anim = viz.animate_orbit(
-            history, moon,
-            spin_exaggeration=args.spin_exaggeration,
-            filename=args.save,
-        )
-
-    if not args.no_show:
-        plt.show()
-
-    return history, anim
+lat, lon, alt = moon.geodetic(h_lander.r[-1], h_lander.t[-1])
+print(f"\ntouchdown:  lat {np.rad2deg(lat):+8.4f} deg"
+      f"  lon {np.rad2deg(lon):+8.4f} deg"
+      f"  alt {alt*1e3:+6.2f} m")
 
 
-if __name__ == "__main__":
-    main()
+# Visualise
+
+show_full_mission(moon, h_stack, h_relay, h_lander, guidance, t_sep,
+                  site_latlon=(-89.0, 0.0),
+                  texture="moon_texture.jpg",
+                  relay_mesh="relay.obj",
+                  lander_mesh="lander.obj",
+                  display_size=DisplayConfig.SPACECRAFT_DISPLAY_SIZE,
+                  offset_factor=DisplayConfig.ATTACHED_OFFSET_FACTOR,
+                  frame_scale=2.0,
+                  time_scale=180.0)
